@@ -1,0 +1,95 @@
+Attention Mechanisms in Deep Learning
+
+Introduction
+
+An attention mechanism is a technique in deep learning that allows a model to
+dynamically focus on the most relevant parts of its input when producing an
+output, rather than treating all parts of the input equally. Instead of
+compressing an entire input sequence into a single fixed-size representation,
+attention lets the model look back at every input position and weigh how
+important each one is for the current computation.
+
+Why Attention Was Introduced
+
+Early sequence-to-sequence models, such as encoder-decoder recurrent neural
+networks used for machine translation, compressed an entire source sentence
+into one fixed-length vector before decoding. This became a bottleneck for
+long sentences, since a single vector could not preserve all the relevant
+detail. Attention was introduced to solve this by allowing the decoder to
+consult the full set of encoder hidden states at every decoding step, rather
+than relying on one summary vector.
+
+How Attention Works
+
+At a high level, attention computes a weighted sum over a set of value
+vectors, where the weights are determined by how relevant each value is to a
+given query. This involves three components:
+
+1. Query (Q) — represents what the model is currently looking for.
+2. Key (K) — represents what each input position offers, used to compute
+   relevance against the query.
+3. Value (V) — the actual content associated with each input position, which
+   gets aggregated based on the attention weights.
+
+The relevance between a query and each key is typically computed using a dot
+product, scaled by the square root of the key dimension to keep gradients
+stable, and then normalized into a probability distribution using softmax.
+This distribution is the attention weights. The final output is a weighted
+sum of the value vectors, using these attention weights.
+
+Self-Attention
+
+Self-attention is a specific case where the queries, keys, and values all come
+from the same sequence. This allows every position in a sequence to attend to
+every other position, capturing relationships regardless of distance — for
+example, connecting a pronoun to the noun it refers to several words earlier
+in a sentence. This is in contrast to recurrent networks, which process
+sequences step by step and can struggle to retain information over long
+distances.
+
+Multi-Head Attention
+
+Rather than computing attention once, transformer models compute it multiple
+times in parallel using different learned projections of the queries, keys,
+and values. Each of these parallel computations is called an attention head.
+Different heads can learn to focus on different types of relationships — one
+head might capture syntactic structure, while another captures long-range
+semantic dependencies. The outputs of all heads are concatenated and linearly
+transformed to produce the final result.
+
+Attention in the Transformer Architecture
+
+The transformer architecture, introduced in the paper "Attention Is All You
+Need," relies entirely on attention mechanisms and removes recurrence
+altogether. It uses:
+
+- Encoder self-attention — each input token attends to all other input
+  tokens.
+- Decoder masked self-attention — each output token attends only to earlier
+  output tokens, preventing the model from seeing future tokens during
+  training.
+- Encoder-decoder cross-attention — the decoder attends to the encoder's
+  output, similar to the original attention mechanism used in translation
+  models.
+
+Because attention has no inherent notion of sequence order, transformers add
+positional encodings to the input embeddings so the model can distinguish
+between tokens at different positions.
+
+Why Attention Matters for RAG Systems
+
+In retrieval-augmented generation, the underlying language model uses
+self-attention to relate the retrieved context chunks to the user's query
+when generating an answer. This is what allows the model to identify which
+parts of the retrieved text are actually relevant to answering the question,
+even when the retrieved context contains multiple unrelated pieces of
+information.
+
+Summary
+
+Attention mechanisms let a model assign different levels of importance to
+different parts of its input, rather than treating all input equally. This
+solved the fixed-length bottleneck of earlier sequence models, enabled
+self-attention within a single sequence, and became the foundational
+building block of transformer architectures that now power most modern
+large language models.

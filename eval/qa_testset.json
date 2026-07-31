@@ -1,0 +1,30 @@
+[
+  {
+    "question": "What are the three components involved in computing attention?",
+    "ground_truth": "The three components are Query (Q), which represents what the model is looking for; Key (K), which represents what each input position offers for computing relevance; and Value (V), the actual content that gets aggregated based on attention weights."
+  },
+  {
+    "question": "Why was the attention mechanism originally introduced?",
+    "ground_truth": "Attention was introduced because early encoder-decoder sequence models compressed an entire source sentence into a single fixed-length vector, which became a bottleneck for long sentences. Attention lets the decoder consult all encoder hidden states at every step instead of relying on one summary vector."
+  },
+  {
+    "question": "How is self-attention different from cross-attention where the decoder attends to the encoder's output?",
+    "ground_truth": "Self-attention is a specific case where the queries, keys, and values all come from the same sequence, allowing every position to attend to every other position within that sequence, regardless of distance. This differs from encoder-decoder cross-attention, where the decoder attends to the encoder's output rather than to its own sequence."
+  },
+  {
+    "question": "What is multi-head attention and why is it useful?",
+    "ground_truth": "Multi-head attention computes attention multiple times in parallel using different learned projections of queries, keys, and values. Different heads can learn to focus on different types of relationships, such as syntactic structure versus long-range semantic dependencies, and their outputs are concatenated and linearly transformed."
+  },
+  {
+    "question": "Why do transformers need positional encodings?",
+    "ground_truth": "Because attention has no inherent notion of sequence order, transformers add positional encodings to the input embeddings so the model can distinguish between tokens at different positions."
+  },
+  {
+    "question": "What is machine learning?",
+    "ground_truth": "Machine learning is a subset of artificial intelligence that enables systems to learn patterns from data and improve their performance on a task without being explicitly programmed for every rule."
+  },
+  {
+    "question": "What is Python commonly used for?",
+    "ground_truth": "Python is a general-purpose programming language commonly used for web development, data analysis, automation, scripting, and artificial intelligence/machine learning applications."
+  }
+]
