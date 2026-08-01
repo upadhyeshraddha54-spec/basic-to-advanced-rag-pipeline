@@ -1,213 +1,191 @@
-# Advanced RAG Pipeline
+# RAG Pipeline: From Basic to Advanced
 
-A Retrieval-Augmented Generation (RAG) system that started as a basic FAISS + Groq pipeline and was
-extended, one technique at a time, into a production-style advanced RAG system — with a real, honest
-evaluation comparing the basic version against the advanced one.
+This project started as a simple Retrieval-Augmented Generation (RAG) system — load some documents,
+embed them, search with FAISS, ask an LLM to answer. Over time I extended it into a full advanced RAG
+pipeline, one technique at a time, wrapped it in a FastAPI service, containerized it with Docker, and
+finally evaluated whether all that extra complexity actually helped.
 
-This README documents the full journey: what was built, why each technique was added, what actually
-worked, what failed along the way, and what we learned from the failures. Nothing here is cleaned up
-to hide the messy parts — the debugging story is part of the point.
+Short answer: mostly yes, in the ways that matter, but not without a lot of real debugging along the
+way. This README walks through the whole thing honestly — what was built, what broke, and what I
+learned from the failures, including the Docker deployment itself.
 
 ---
 
 ## Tech Stack
 
-- **LangChain** — document loading, text splitting, retriever interfaces
-- **FAISS** — vector similarity search
-- **Groq** (`llama-3.3-70b-versatile`, `llama-3.1-8b-instant`) — generation and LLM-based tasks
-- **sentence-transformers** (`all-MiniLM-L6-v2`) — embeddings
-- **rank-bm25** — keyword search
-- **cross-encoder/ms-marco-MiniLM-L-6-v2** — re-ranking
-- **pandas** — evaluation result handling
+- **LangChain** for document loading and text splitting
+- **FAISS** for vector search
+- **Groq** (`llama-3.3-70b-versatile` for generation, `llama-3.1-8b-instant` for cheaper high-volume calls)
+- **sentence-transformers** (`all-MiniLM-L6-v2`) for embeddings
+- **rank-bm25** for keyword search
+- **cross-encoder/ms-marco-MiniLM-L-6-v2** for re-ranking
+- **FastAPI + Uvicorn** for the API layer
+- **Docker** for containerized deployment
 
 ---
 
-## Where We Started: The Basic Pipeline
+## Part 1: The Basic Pipeline
 
-Before any of the advanced work, this was a simple RAG pipeline:
+Before any of the advanced work, this was the whole system:
 
-1. **Load** documents from `data/` — PDF, TXT, CSV, DOCX, XLSX, JSON
-2. **Chunk** text into overlapping pieces (`chunk_size=1000`, `chunk_overlap=200`)
-3. **Embed** chunks with `all-MiniLM-L6-v2`
-4. **Store** vectors in a FAISS index
-5. **Retrieve** the top-k most similar chunks for a query
-6. **Generate** an answer by handing those chunks to Groq's `llama-3.3-70b-versatile`
+1. Load documents from `data/` — PDF, TXT, CSV, DOCX, XLSX, JSON
+2. Split them into overlapping chunks (1000 characters, 200 overlap)
+3. Embed each chunk with `all-MiniLM-L6-v2`
+4. Store the vectors in FAISS
+5. At query time, pull the top-k most similar chunks
+6. Hand those chunks to Groq's `llama-3.3-70b-versatile` and ask it to answer
 
-This works, but it has real limitations: one search method (pure vector similarity), no relevance
-filtering, no query understanding beyond the literal wording, and no way to measure whether it's
-actually any good. Everything below addresses one of those gaps.
-
----
-
-## The 8 Techniques We Added
-
-### 1. Metadata Filtering
-**Problem:** there was no way to search only within a subset of documents (e.g. "only PDFs" or
-"only files modified this month").
-
-**What we did:** every chunk now carries consistent metadata regardless of source file type —
-`file_type`, `file_name`, `source_path`, `file_size_bytes`, `modified_at`, `ingested_at` — attached
-during loading (`src/data_loader.py`). The vector store's `search()`/`query()` methods accept a
-`metadata_filter` dict and support both exact match (`{"file_type": "pdf"}`) and membership
-(`{"file_type": ["pdf", "csv"]}`).
-
-**How it works under the hood:** FAISS has no native metadata filtering, so we use an
-**over-fetch-then-filter** approach — pull a larger candidate pool from FAISS, filter by metadata,
-then truncate to the requested `top_k`.
-
-**Result:** worked correctly on the first real test — filtering to `file_type: "csv"` returned only
-CSV rows, filtering to `"pdf"` returned only PDF chunks.
+It works, and for a lot of use cases it's genuinely fine. But it has clear gaps: only one way to
+search, no filtering by document type or date, no handling for differently-worded questions, and no
+way to actually measure whether it's any good. Everything below targets one of those gaps.
 
 ---
 
-### 2. Hybrid Search (BM25 + FAISS)
-**Problem:** pure vector search (FAISS) is good at "meaning" matches but can miss exact keywords,
-IDs, or acronyms. Pure keyword search (BM25) is the opposite.
+## Part 2: What Got Added, and Why
 
-**What we did:** built a BM25 index over the same chunk text stored in FAISS metadata
-(`src/hybrid_search.py`), then merged BM25's ranked list with FAISS's ranked list using
-**Reciprocal Rank Fusion (RRF)** — `score = Σ 1/(rrf_k + rank + 1)` across both lists. RRF is
-scale-free, which matters because BM25 scores and FAISS L2 distances live on completely
-incompatible scales — you can't average them directly.
+### Metadata Filtering
 
-**Result:** confirmed working — for the query "attention mechanism," hybrid search correctly
-surfaced a CSV row about deep learning that pure FAISS search alone would have ranked lower, purely
-because BM25 caught the keyword overlap FAISS's embedding missed.
+Every chunk gets tagged at load time with `file_type`, `file_name`, `source_path`, `file_size_bytes`,
+`modified_at`, and `ingested_at`. The vector store's search function accepts a filter dict, so you can
+say "only search CSV files" and it'll respect that. FAISS doesn't filter natively, so this works by
+over-fetching a larger candidate pool, filtering by metadata, then trimming to the requested count.
+Tested with CSV-only and PDF-only filters — worked cleanly both times.
 
----
+### Hybrid Search (BM25 + FAISS)
 
-### 3. Cross-Encoder Re-ranking
-**Problem:** hybrid search is fast but imprecise — FAISS and BM25 both score the query and each
-chunk *independently*, then compare. This misses a lot of nuance.
+Vector search matches meaning but can miss exact keywords or IDs. BM25 (keyword search) is the
+opposite. Both run side by side, and results are merged using **Reciprocal Rank Fusion** — a chunk
+that ranks well in either list gets boosted, using rank position rather than raw scores (which aren't
+on comparable scales anyway). Confirmed working: for "attention mechanism," hybrid search pulled up a
+relevant CSV row that pure FAISS ranked lower, because BM25 caught a keyword match the embedding
+missed.
 
-**What we did:** took hybrid search's top ~20–30 candidates and re-scored each `(query, chunk)` pair
-using a **cross-encoder** (`cross-encoder/ms-marco-MiniLM-L-6-v2`) — a model that looks at the query
-and chunk *together*. Cross-encoders are far more accurate but too slow to run on an entire corpus,
-which is why they're only applied to hybrid search's already-narrowed candidate pool.
+### Cross-Encoder Re-ranking
 
-**Result — and an important honest finding:** in one test, the reranker correctly *demoted* CSV
-rows that had matched on keyword overlap ("Deep Learning", "NLP") but turned out to be generic
-templated filler text ("This document discusses..."), rather than genuine explanations. This
-was the reranker doing exactly its job — filtering out lexically-matched-but-semantically-empty
-content.
+Hybrid search scores the query and each chunk separately, then compares - fast but imprecise. A
+cross-encoder looks at the query and chunk *together* for a much more accurate score, applied only to
+hybrid search's top 20-30 candidates since it's too slow to run on everything. Caught something real:
+a few CSV rows matched on keyword overlap but turned out to be generic templated filler, not real
+explanations. The reranker correctly pushed those down.
 
----
+### Query Transformation
 
-### 4. Query Transformation (three sub-techniques, one file)
+Three related techniques in one file:
+- **Query Expansion** - the LLM rewrites the question a few different ways to catch different phrasing.
+- **Multi-Query Retrieval** - search runs once per rewritten version, results get merged.
+- **Self-Query Retriever** - the LLM splits a question like "find CSV rows about deep learning" into
+  a search term plus a metadata filter automatically.
 
-**Query Expansion** — the LLM generates alternate phrasings of a query (e.g. "attention mechanism"
-→ "focus mechanism", "concentration technique") to widen recall for synonyms or different wording.
+All three worked as intended. Self-query was the cleanest result - parsed correctly, every result
+genuinely matched the requested filter.
 
-**Multi-Query Retrieval** — retrieval runs once per query variant, then results are merged by
-summing RRF-style scores across variants, so a chunk multiple phrasings agree on ranks higher.
+### Contextual Compression
 
-**Self-Query Retriever** — the LLM parses a natural question like *"find CSV rows about deep
-learning"* into a semantic search string (`"deep learning"`) + a structured metadata filter
-(`{"file_type": "csv"}`) — automatically, without the user specifying filters manually. A safety
-net drops any field the LLM hallucinates that isn't a real metadata field.
+Trims each retrieved chunk down to just the relevant sentences, or drops it entirely if nothing in it
+is relevant. This is the technique that caused the most real trouble:
 
-**Result:** all three worked. Self-query in particular was a clean win — the test query correctly
-parsed into the right semantic query + filter, and every returned result was genuinely from the
-CSV file as requested.
+An early version of the compression prompt was too strict, requiring close-to-literal wording overlap
+with the query. On one test question, this threw away the one chunk that actually answered it, because
+that chunk never used the query's exact phrasing. The LLM then answered "I don't know," tanking that
+question's score to zero. Fixed it two ways: loosened the compression prompt to keep supporting
+context, and added a fallback - if compression leaves too few chunks, fall back to the uncompressed
+reranked chunks instead of risking a starved answer. It also turned out the test question itself used
+a term the source document never used, so I reworded it too.
 
----
+**The real lesson:** a technique working exactly as designed can still hurt results if it's tuned too
+aggressively, or if your test data doesn't match your test questions.
 
-### 5. Contextual Compression
-**Problem:** a retrieved chunk often mixes relevant and irrelevant sentences. Passing the whole
-chunk to the generation LLM wastes context and dilutes the signal.
+### Parent Document Retriever
 
-**What we did:** used the LLM to trim each retrieved chunk down to just the sentences relevant to
-the query (or drop the chunk entirely if nothing in it is relevant), using a
-`NO_RELEVANT_CONTENT` marker to signal a full drop (`src/compressor.py`).
+Small chunks search precisely but lack context; big chunks carry context but their embeddings get
+diluted. This splits documents into large "parent" chunks (~2000 chars) and small "child" chunks
+(~400 chars). Only children get embedded and searched; when one matches, its parent is returned for
+full context. Found a real limitation: the best-matching child chunk was literally the heading
+"Multi-Head Attention," but it sat right at a parent-chunk boundary, so the parent returned was
+actually the adjacent section. A known tradeoff of splitting by character count instead of document
+structure.
 
-**What actually failed, and what we learned:** this is the technique that caused the most real
-debugging. Two failure modes showed up during evaluation:
+### Evaluation
 
-- **Over-aggressive trimming:** an early version of the compression prompt was too strict —
-  it required near-literal wording overlap with the query. On one test question ("difference
-  between self-attention and regular attention"), compression discarded the one chunk that
-  actually explained self-attention, because that chunk didn't use the literal phrase "regular
-  attention." The generation LLM then correctly (but unhelpfully) answered "I don't know."
-- **Fix, part 1:** loosened the compression prompt to keep supporting/background context, not
-  just exact-wording matches ("be inclusive rather than overly strict").
-- **Fix, part 2:** added a **fallback safety net** in the evaluation pipeline — if compression
-  leaves fewer than a minimum number of chunks, fall back to the uncompressed reranked chunks
-  rather than risk generating from a starved context.
-- **The deeper root cause** turned out to be a mismatch between the test question's wording
-  ("regular attention," a term our source document never uses) and the corpus's actual
-  terminology — combined with an overly strict "say you don't know" instruction in the generation
-  prompt. Fixing both the question wording and loosening the generation prompt resolved it.
+Built a 7-question test set with real ground-truth answers, then measured Context Precision, Context
+Recall, Faithfulness, and Answer Relevancy for the basic pipeline vs. the full advanced one.
 
-This whole episode is genuinely one of the more useful things to talk about from this project:
-**a technique working "correctly" in isolation can still hurt end-to-end quality if it's tuned too
-aggressively or paired with a test question that doesn't match the corpus.**
+Hit a real snag: the `ragas` library (v0.4.3) has a broken import - it pulls in `ChatVertexAI` from a
+`langchain_community` path that's been removed. After failed attempts to fix it via dependency pins,
+I wrote a custom LLM-as-judge evaluator instead (`eval/custom_metrics.py`), scoring each metric by
+directly prompting an LLM. A legitimate, well-known technique, and arguably better to show than
+calling a library function, since it means actually understanding what's being measured.
 
----
+**Final numbers:**
 
-### 6. Parent Document Retriever
-**Problem:** small chunks embed precisely but lack surrounding context. Large chunks give context
-but their embeddings get diluted trying to represent multiple ideas at once.
-
-**What we did:** two-level chunking (`src/parent_retriever.py`) — documents are split into large
-**parent** chunks (~2000 chars) and each parent is further split into small **child** chunks (~400
-chars). Only child chunks are embedded and searched (precision). When a child chunk matches, its
-parent is returned instead (context), deduplicated across matches.
-
-**Result — another honest, real finding:** in testing, the single best-matching child chunk was
-literally the heading `"Multi-Head Attention"` — a very sharp match. But that heading happened to
-sit right at the boundary between two parent chunks, so the parent returned was actually the
-adjacent "Self-Attention" section, not the ideal one. This is a known, realistic limitation of
-naive character-count-based parent chunking (as opposed to splitting along document structure or
-headings) — worth naming explicitly rather than hiding.
-
----
-
-### 7. RAG Evaluation
-**Problem:** up to this point, quality was being judged by eyeballing outputs. That doesn't scale
-and isn't rigorous.
-
-**What we did:** built a 7-question hand-crafted test set (`eval/qa_testset.json`) with real
-ground-truth answers based on our own corpus content, then measured four standard RAG metrics for
-both the **baseline** pipeline (plain FAISS → generate) and the **advanced** pipeline (hybrid
-search → rerank → contextual compression → generate):
-
-- **Context Precision** — of what got retrieved, how much was actually relevant?
-- **Context Recall** — did retrieval capture everything needed to answer fully?
-- **Faithfulness** — is the generated answer actually grounded in retrieved context, or hallucinated?
-- **Answer Relevancy** — does the answer actually address the question asked?
-
-**A real dependency problem we hit and solved:** the popular `ragas` evaluation library (v0.4.3)
-has a broken import — it unconditionally imports `ChatVertexAI` from a `langchain_community`
-module path that's been removed in current versions. After trying dependency upgrades and version
-pins without success, we replaced it with a **custom LLM-as-judge evaluator**
-(`eval/custom_metrics.py`) that implements the same four metric definitions by directly prompting
-an LLM to score each aspect on a 0.0–1.0 scale. This is a legitimate, well-known evaluation
-technique, and arguably a stronger thing to show in a portfolio than calling a library function,
-since it demonstrates understanding of what each metric actually measures.
-
-**Final results:**
-
-| Metric | Baseline | Advanced | Change |
+| Metric | Basic Pipeline | Advanced Pipeline | Change |
 |---|---|---|---|
-| Context Precision | 0.574 | **0.679** | **+0.105 (meaningfully better)** |
-| Context Recall | 0.810 | 0.737 | −0.073 (expected precision/recall tradeoff) |
-| Faithfulness | 0.896 | 0.894 | ≈ unchanged |
-| Answer Relevancy | 0.936 | 0.921 | ≈ unchanged |
+| Context Precision | 0.574 | **0.679** | **+0.105 - meaningfully better** |
+| Context Recall | 0.810 | 0.737 | -0.073 |
+| Faithfulness | 0.896 | 0.894 | basically unchanged |
+| Answer Relevancy | 0.936 | 0.921 | basically unchanged |
 
-**How to read this honestly:** the advanced pipeline delivers meaningfully cleaner retrieval
-(higher precision) without sacrificing faithfulness or answer relevancy (both differences are
-within noise). The recall dip is a real, expected tradeoff — aggressive compression and reranking
-narrow the context down, which occasionally trims something that would have added completeness,
-even though it doesn't hurt the final answer's grounding. This is a far more credible result than
-a flat "everything got better" — it shows the specific tradeoff advanced retrieval techniques
-actually make.
+The advanced pipeline retrieves noticeably cleaner context without giving up faithfulness or
+relevancy. The recall dip is an expected tradeoff - narrowing context down occasionally trims
+something that would've added completeness, even without hurting the actual answer.
 
-**A rate-limit lesson worth mentioning too:** the evaluation makes many LLM calls (generation +
-4 judge calls × 7 questions × 2 pipelines, plus one compression call per candidate chunk). This
-exhausted Groq's free-tier daily token quota for `llama-3.3-70b-versatile` mid-run more than once.
-The fix was to move compression, generation, and judging over to the smaller, separately-quota'd
-`llama-3.1-8b-instant` model for evaluation runs — a practical lesson in managing LLM API costs
-during development.
+---
+
+## Part 3: Wrapping It in an API
+
+Once the pipelines worked, I wrapped them in a FastAPI service so they're usable outside a Python
+script.
+
+### API Architecture
+
+Two endpoints, both backed by the same underlying pipelines:
+
+- `POST /v1/search/baseline` - plain FAISS similarity search -> generate
+- `POST /v1/search/advanced` - hybrid search -> cross-encoder rerank -> contextual compression -> generate
+  (with the same compression fallback safety net used in evaluation)
+- `GET /health` - reports whether both pipelines are loaded and ready
+
+Models and indexes load **once** at startup via a FastAPI `lifespan` context manager, not per-request
+- reloading a sentence-transformer or cross-encoder on every call would be far too slow. Since FAISS,
+sentence-transformers, and the Groq client are all blocking/synchronous, blocking calls are offloaded
+to a thread pool (`run_in_threadpool`) so the async event loop stays responsive under concurrent load.
+
+Interactive API docs are auto-generated by FastAPI at `/docs` once the server is running.
+
+### Production Deployment (Docker)
+
+The app is fully containerized so it runs identically on any machine, not just the one it was
+developed on.
+
+```bash
+docker compose up --build
+```
+
+This builds a multi-stage image (build dependencies in one stage, a slim runtime image in the second)
+and starts the API on `http://localhost:8000`.
+
+**A few real things that went wrong getting here, worth knowing about:**
+
+- **CUDA bloat:** the first build attempt pulled multi-GB CUDA/cuDNN packages for PyTorch, even though
+  this container only ever does CPU inference and has no GPU access. Fixed by explicitly installing
+  the CPU-only PyTorch build (`--index-url https://download.pytorch.org/whl/cpu`) before installing
+  anything else.
+- **Host disk space:** Docker builds failed with cryptic `input/output error` messages that turned out
+  to be the host machine's disk being essentially full, not a Docker or code problem. Freeing disk
+  space on the host fixed it.
+- **Corrupted Docker state:** after the disk-full failures, Docker's own internal metadata got
+  corrupted, requiring a full `docker system prune` and Docker Desktop restart before builds could
+  succeed again.
+- **Missing dependency:** `faiss-cpu` was installed locally but never actually listed in
+  `requirements.txt`, so the container crashed with `ModuleNotFoundError: No module named 'faiss'`
+  until it was added explicitly, both to `requirements.txt` and the Dockerfile.
+- **Build cache:** added `--mount=type=cache` on pip install steps so that after the first (necessarily
+  slow) build, any future dependency fix only takes about a minute instead of triggering a full
+  re-download.
+
+None of these were exotic problems - they're exactly the kind of environment/dependency friction that
+comes up in real deployment work, and worth being upfront about rather than pretending the first
+`docker build` just worked.
 
 ---
 
@@ -215,35 +193,40 @@ during development.
 
 ```
 rag/
-├── src/
-│   ├── data_loader.py        # Loads PDF/TXT/CSV/DOCX/XLSX/JSON, tags metadata
-│   ├── vectorstore.py        # FAISS store: build, save, load, query, metadata filtering
-│   ├── hybrid_search.py      # BM25 + FAISS fusion via Reciprocal Rank Fusion
-│   ├── reranker.py           # Cross-encoder re-ranking
-│   ├── query_transform.py    # Query expansion, multi-query, self-query retriever
-│   ├── compressor.py         # Contextual compression
-│   ├── parent_retriever.py   # Parent/child two-level chunking retriever
-│   ├── embedding.py          # Chunking + embedding pipeline
-│   └── search.py             # Original baseline RAG search + Groq summarization
-├── eval/
-│   ├── qa_testset.json       # 7 hand-crafted Q&A pairs with ground truth
-│   ├── custom_metrics.py     # LLM-as-judge implementation of the 4 RAGAS-style metrics
-│   ├── run_ragas.py          # Runs baseline vs. advanced pipeline, evaluates both
-│   ├── results_baseline.csv  # Per-question scores, baseline pipeline
-│   └── results_advanced.csv  # Per-question scores, advanced pipeline
-├── data/                     # Source documents
-│   ├── pdf/
-│   ├── text_files/
-│   └── csv/
-├── faiss_store/              # Main FAISS index + metadata + BM25 index
-├── faiss_store_parent/       # Parent-document retriever's separate index
-├── requirements.txt
-└── .env                      # GROQ_API_KEY (not committed)
+|-- app/
+|   |-- main.py                # FastAPI gateway (baseline + advanced endpoints)
+|   `-- schemas.py              # Pydantic request/response models
+|-- src/
+|   |-- data_loader.py          # loads files, tags metadata
+|   |-- vectorstore.py          # FAISS store + metadata filtering
+|   |-- hybrid_search.py        # BM25 + FAISS with RRF
+|   |-- reranker.py             # cross-encoder re-ranking
+|   |-- query_transform.py      # expansion, multi-query, self-query
+|   |-- compressor.py           # contextual compression
+|   |-- parent_retriever.py     # parent/child chunking
+|   |-- embedding.py            # chunking + embedding
+|   `-- search.py               # original basic pipeline
+|-- eval/
+|   |-- qa_testset.json         # 7 test questions with ground truth
+|   |-- custom_metrics.py       # LLM-as-judge metric implementations
+|   |-- run_ragas.py            # runs basic vs advanced, evaluates both
+|   |-- results_baseline.csv
+|   `-- results_advanced.csv
+|-- data/
+|   |-- pdf/
+|   |-- text_files/
+|   `-- csv/
+|-- faiss_store/                # main index (mounted as a volume in Docker)
+|-- faiss_store_parent/         # parent-retriever's separate index
+|-- Dockerfile
+|-- docker-compose.yml
+|-- requirements.txt
+`-- .env                        # GROQ_API_KEY, not committed
 ```
 
 ---
 
-## Setup
+## Setup (Running Locally, Without Docker)
 
 ```bash
 git clone https://github.com/upadhyeshraddha54-spec/rag.git
@@ -251,17 +234,25 @@ cd rag
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-pip install rank-bm25 langchain-text-splitters pandas
 ```
 
-Create a `.env` file in the root:
+Add a `.env` file:
 ```
 GROQ_API_KEY=your_groq_api_key_here
 ```
 
-**Important:** every module lives inside `src/` or `eval/` and uses package-relative imports. Always
-run modules from the repo root using the `-m` flag, never by path directly:
+Build the indexes (only needed once, or after adding new data):
+```bash
+python -m src.hybrid_search
+```
 
+Run the API:
+```bash
+uvicorn app.main:app --reload
+```
+
+Visit `http://127.0.0.1:8000/docs` to try it interactively, or run individual pipeline modules
+directly (always as a module, from the repo root):
 ```bash
 python -m src.data_loader
 python -m src.vectorstore
@@ -273,52 +264,54 @@ python -m src.parent_retriever
 python -m eval.run_ragas
 ```
 
+## Setup (Running with Docker)
+
+```bash
+docker compose up --build
+```
+
+Then, in another terminal:
+```bash
+curl http://localhost:8000/health
+```
+
 ---
 
-## Key Learnings
+## What I'd Tell Someone Else Doing This
 
-- **"Advanced" doesn't automatically mean "better."** Every technique we added had to be tuned —
-  contextual compression in particular could actively hurt results if configured too aggressively.
-- **Metadata quality matters as much as the retrieval algorithm.** Self-query retrieval is only as
-  good as the metadata fields it can filter on.
-- **Test data quality matters.** Early evaluation runs on a query ("attention mechanism") the
-  corpus had no real content for produced misleading results across every technique — a data
-  problem, not a pipeline problem. Adding one real, accurate reference document fixed this.
-- **Test *question* wording matters too.** A ground-truth question using terminology the corpus
-  never uses ("regular attention") caused a false catastrophic failure that looked like a pipeline
-  bug but was actually a corpus/question mismatch combined with an overly strict generation prompt.
-- **Dependency issues are part of real ML engineering.** The `ragas` library's broken import wasn't
-  a dead end — building a custom LLM-as-judge evaluator instead was a legitimate (and arguably
-  better) solution.
-- **Watch your API token budget during evaluation.** Comparing two pipelines across many metrics
-  and questions adds up fast; a smaller model for high-volume calls (compression, judging) avoids
-  hitting rate limits mid-experiment.
+- Adding more techniques doesn't automatically improve results - each one needs tuning, and
+  compression especially can hurt more than it helps if it's too aggressive.
+- Self-query retrieval is only as good as your metadata.
+- Check your test data actually contains what your test questions ask about - a corpus/question
+  mismatch can look exactly like a pipeline bug.
+- When a library breaks (looking at you, `ragas`), building a small custom version can genuinely be
+  the better choice, since it forces you to understand what you're measuring.
+- Budget your API tokens - evaluation runs far more LLM calls than you'd expect.
+- Docker failures are very often not about your code - disk space and corrupted local state caused
+  more of the real debugging here than anything in the Dockerfile itself.
 
 ---
 
 ## Pushing to GitHub
 
-If this is the first time pushing (repo not yet initialized):
-
+If the repo isn't connected yet:
 ```bash
 git init
 git add .
-git commit -m "Advanced RAG: hybrid search, reranking, query transformation, compression, parent retrieval, evaluation"
+git commit -m "Advanced RAG: hybrid search, reranking, query transformation, compression, parent retrieval, evaluation, FastAPI, Docker"
 git branch -M main
 git remote add origin https://github.com/upadhyeshraddha54-spec/rag.git
 git push -u origin main
 ```
 
-If the repo already exists and is already connected to GitHub (as this one is), just commit and push
-the new work:
-
+If it's already connected:
 ```bash
 git add .
-git commit -m "Add hybrid search, reranking, query transformation, compression, parent retriever, and evaluation"
+git commit -m "Add FastAPI gateway and Docker deployment"
 git push
 ```
 
-**Before committing, make sure these are excluded** (add to `.gitignore` if not already there):
+Before committing, make sure your `.gitignore` includes:
 ```
 .env
 .venv/
@@ -327,13 +320,6 @@ faiss_store/
 faiss_store_parent/
 *.pkl
 ```
-The FAISS indexes and pickled metadata/BM25 files can be large and are regenerable from `data/` —
-they don't need to live in version control. Your `.env` should never be committed since it contains
-your API key.
 
-After pushing, double check on GitHub that:
-- `README.md` renders correctly
-- `.env` is NOT visible in the repository (if it is, rotate your Groq API key immediately and add
-  `.env` to `.gitignore` retroactively)
-- The `eval/results_baseline.csv` and `eval/results_advanced.csv` files are present, since they're
-  good evidence of real evaluation work
+Never commit `.env`. If it's ever committed by accident, rotate your Groq API key immediately, not
+just remove the file.

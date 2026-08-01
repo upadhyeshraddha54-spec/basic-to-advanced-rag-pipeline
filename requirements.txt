@@ -1,12 +1,37 @@
+# Core LangChain
 langchain
-langchain-core
 langchain-community
-langchain-text-splitters
 langchain-groq
-pypdf
-pymupdf
+langchain-text-splitters
+
+# Vector search & embeddings
+faiss-cpu
 sentence-transformers
-chromadb
-scikit-learn
-numpy
 rank-bm25
+numpy
+
+# Document loaders (used by src/data_loader.py)
+pypdf
+docx2txt
+unstructured
+openpyxl
+
+# LLM API
+groq
+python-dotenv
+
+# Evaluation
+pandas
+
+# API layer (app/main.py, app/schemas.py)
+fastapi
+uvicorn[standard]
+pydantic
+
+# NOTE ON TORCH: intentionally NOT pinned here. sentence-transformers and
+# the cross-encoder reranker both depend on torch, but the plain PyPI
+# "torch" package defaults to a CUDA build (multi-GB, GPU-only, useless in
+# this CPU-only Docker container). The Dockerfile installs the CPU-only
+# build explicitly via --index-url https://download.pytorch.org/whl/cpu
+# BEFORE this file is installed. Locally, whatever torch got installed as
+# a dependency of sentence-transformers in your .venv is fine as-is.
